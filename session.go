@@ -51,7 +51,7 @@ github.com/Baozisoftware/qrcode-terminal-go Example login procedure:
 	}
 	fmt.Printf("login successful, session: %v\n", session)
 */
-func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
+func (wac *Conn) Login(qrChan chan<- string, message string) (Session, error) {
 	session := Session{}
 
 	if wac.session != nil && (wac.session.EncKey != nil || wac.session.MacKey != nil) {
@@ -66,7 +66,7 @@ func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 
 	session.ClientId = base64.StdEncoding.EncodeToString(clientId)
 	//oldVersion=8691
-	login := []interface{}{"admin", "init", []int{0, 2, 9229}, []string{"github.com/rhymen/go-whatsapp", "go-whatsapp"}, session.ClientId, true}
+	login := []interface{}{"admin", "init", []int{0, 2, 9229}, []string{message, "go-whatsapp"}, session.ClientId, true}
 	loginChan, err := wac.write(login)
 	if err != nil {
 		return session, fmt.Errorf("error writing login: %v\n", err)
