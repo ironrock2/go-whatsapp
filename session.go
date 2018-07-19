@@ -163,7 +163,7 @@ WhatsAppWeb servers with the provided session. If it succeeds it will return a n
 saved because the Client and Server-Token will change after every login. Logging in with old tokens is possible, but not
 suggested. If so, a challenge has to be resolved which is just another possible point of failure.
 */
-func (wac *Conn) RestoreSession(session Session) (Session, error) {
+func (wac *Conn) RestoreSession(session Session, message string) (Session, error) {
 	if wac.session != nil && (wac.session.EncKey != nil || wac.session.MacKey != nil) {
 		return Session{}, fmt.Errorf("already logged in")
 	}
@@ -174,7 +174,7 @@ func (wac *Conn) RestoreSession(session Session) (Session, error) {
 	wac.listener["s1"] = make(chan string, 1)
 
 	//admin init
-	init := []interface{}{"admin", "init", []int{0, 2, 9229}, []string{"github.com/rhymen/go-whatsapp", "go-whatsapp"}, session.ClientId, true}
+	init := []interface{}{"admin", "init", []int{0, 2, 9229}, []string{message, "go-whatsapp"}, session.ClientId, true}
 	initChan, err := wac.write(init)
 	if err != nil {
 		wac.session = nil
