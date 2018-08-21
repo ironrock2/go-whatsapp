@@ -32,32 +32,33 @@ func (wac *Conn) Send(msg interface{}) error {
 	case ImageMessage:
 		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.upload(m.Content, image)
 		if err != nil {
-			return fmt.Errorf("upload failed: %v", err)
+			return fmt.Errorf("image upload failed: %v", err)
 		}
 		ch, err = wac.sendProto(getImageProto(m))
 	case VideoMessage:
 		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.upload(m.Content, video)
 		if err != nil {
-			return fmt.Errorf("upload failed: %v", err)
+			return fmt.Errorf("video upload failed: %v", err)
 		}
 		ch, err = wac.sendProto(getVideoProto(m))
 	case DocumentMessage:
 		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.upload(m.Content, document)
 		if err != nil {
-			return fmt.Errorf("upload failed: %v", err)
+			return fmt.Errorf("document upload failed: %v", err)
 		}
 		ch, err = wac.sendProto(getDocumentProto(m))
 	case AudioMessage:
 		m.url, m.mediaKey, m.fileEncSha256, m.fileSha256, m.fileLength, err = wac.upload(m.Content, audio)
 		if err != nil {
-			return fmt.Errorf("upload failed: %v", err)
+			return fmt.Errorf("audio upload failed: %v", err)
 		}
 		ch, err = wac.sendProto(getAudioProto(m))
 	default:
-		return fmt.Errorf("cannot match type %T, use messagetypes declared in the package", msg)
+		return fmt.Errorf("cannot match type %T, use message types declared in the package", msg)
 	}
+
 	if err != nil {
-		return fmt.Errorf("error sending message:%v", err)
+		return fmt.Errorf("could not send proto: %v", err)
 	}
 
 	select {
@@ -96,12 +97,25 @@ func init() {
 MessageInfo contains general message information. It is part of every of every message type.
 */
 type MessageInfo struct {
-	Id        string
-	RemoteJid string
-	FromMe    bool
-	Timestamp uint64
-	PushName  string
+	Id              string
+	RemoteJid       string
+	FromMe          bool
+	Timestamp       uint64
+	PushName        string
+	Status          MessageStatus
+	QuotedMessageID string
 }
+
+type MessageStatus int
+
+const (
+	Error       MessageStatus = 0
+	Pending                   = 1
+	ServerAck                 = 2
+	DeliveryAck               = 3
+	Read                      = 4
+	Played                    = 5
+)
 
 func getMessageInfo(msg *proto.WebMessageInfo) MessageInfo {
 	return MessageInfo{
@@ -109,12 +123,12 @@ func getMessageInfo(msg *proto.WebMessageInfo) MessageInfo {
 		RemoteJid: msg.GetKey().GetRemoteJid(),
 		FromMe:    msg.GetKey().GetFromMe(),
 		Timestamp: msg.GetMessageTimestamp(),
+		Status:    MessageStatus(msg.GetStatus()),
 		PushName:  msg.GetPushName(),
 	}
 }
 
 func getInfoProto(info *MessageInfo) *proto.WebMessageInfo {
-	status := proto.WebMessageInfo_STATUS(1)
 	if info.Id == "" || len(info.Id) < 2 {
 		b := make([]byte, 10)
 		rand.Read(b)
@@ -124,6 +138,8 @@ func getInfoProto(info *MessageInfo) *proto.WebMessageInfo {
 		info.Timestamp = uint64(time.Now().Unix())
 	}
 	info.FromMe = true
+
+	status := proto.WebMessageInfo_STATUS(info.Status)
 
 	return &proto.WebMessageInfo{
 		Key: &proto.MessageKey{
@@ -145,10 +161,14 @@ type TextMessage struct {
 }
 
 func getTextMessage(msg *proto.WebMessageInfo) TextMessage {
-	return TextMessage{
-		Info: getMessageInfo(msg),
-		Text: msg.GetMessage().GetConversation(),
+	text := TextMessage{Info: getMessageInfo(msg)}
+	if m := msg.GetMessage().GetExtendedTextMessage(); m != nil {
+		text.Text = m.GetText()
+		text.Info.QuotedMessageID = m.GetContextInfo().GetStanzaId()
+	} else {
+		text.Text = msg.GetMessage().GetConversation()
 	}
+	return text
 }
 
 func getTextProto(msg TextMessage) *proto.WebMessageInfo {
@@ -402,6 +422,9 @@ func parseProtoMessage(msg *proto.WebMessageInfo) interface{} {
 		return getDocumentMessage(msg)
 
 	case msg.GetMessage().GetConversation() != "":
+		return getTextMessage(msg)
+
+	case msg.GetMessage().GetExtendedTextMessage() != nil:
 		return getTextMessage(msg)
 
 	default:
