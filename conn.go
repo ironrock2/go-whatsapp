@@ -2,20 +2,13 @@
 package whatsapp
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/json"
-	"fmt"
-	"github.com/Rhymen/go-whatsapp/binary"
-	"github.com/Rhymen/go-whatsapp/crypto/cbc"
-	"github.com/gorilla/websocket"
 	"math/rand"
 	"net/http"
-	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/pkg/errors"
 )
 
 type metric byte
@@ -78,22 +71,35 @@ Conn is created by NewConn. Interacting with the initialized Conn is the main wa
 It holds all necessary information to make the package work internally.
 */
 type Conn struct {
-	wsConn         *websocket.Conn
+	ws       *websocketWrapper
+	listener *listenerWrapper
+
+	connected bool
+	loggedIn  bool
+	wg        *sync.WaitGroup
+
 	session        *Session
-	listener       map[string]chan string
-	listenerMutex  sync.RWMutex
-	writeChan      chan wsMsg
+	sessionLock    uint32
 	handler        []Handler
 	msgCount       int
 	msgTimeout     time.Duration
 	Info           *Info
 	Store          *Store
 	ServerLastSeen time.Time
+
+	longClientName  string
+	shortClientName string
 }
 
-type wsMsg struct {
-	messageType int
-	data        []byte
+type websocketWrapper struct {
+	sync.Mutex
+	conn  *websocket.Conn
+	close chan struct{}
+}
+
+type listenerWrapper struct {
+	sync.RWMutex
+	m map[string]chan string
 }
 
 /*
@@ -101,184 +107,104 @@ Creates a new connection with a given timeout. The websocket connection to the W
 The goroutine for handling incoming messages is started
 */
 func NewConn(timeout time.Duration) (*Conn, error) {
+	wac := &Conn{
+		handler:    make([]Handler, 0),
+		msgCount:   0,
+		msgTimeout: timeout,
+		Store:      newStore(),
+
+		longClientName:  "github.com/rhymen/go-whatsapp",
+		shortClientName: "go-whatsapp",
+	}
+	return wac, wac.connect()
+}
+
+// connect should be guarded with wsWriteMutex
+func (wac *Conn) connect() (err error) {
+	if wac.connected {
+		return ErrAlreadyConnected
+	}
+	wac.connected = true
+	defer func() { // set connected to false on error
+		if err != nil {
+			wac.connected = false
+		}
+	}()
+
 	dialer := &websocket.Dialer{
 		ReadBufferSize:   25 * 1024 * 1024,
 		WriteBufferSize:  10 * 1024 * 1024,
-		HandshakeTimeout: timeout,
+		HandshakeTimeout: wac.msgTimeout,
 	}
 
 	headers := http.Header{"Origin": []string{"https://web.whatsapp.com"}}
-	wsConn, _, err := dialer.Dial("wss://w3.web.whatsapp.com/ws", headers)
+	wsConn, _, err := dialer.Dial("wss://web.whatsapp.com/ws", headers)
 	if err != nil {
-		return nil, fmt.Errorf("couldn't dial whatsapp web websocket: %v", err)
+		return errors.Wrap(err, "couldn't dial whatsapp web websocket")
 	}
 
-	wac := &Conn{
-		wsConn:        wsConn,
-		listener:      make(map[string]chan string),
-		listenerMutex: sync.RWMutex{},
-		writeChan:     make(chan wsMsg),
-		handler:       make([]Handler, 0),
-		msgCount:      0,
-		msgTimeout:    timeout,
-		Store:         newStore(),
+	wsConn.SetCloseHandler(func(code int, text string) error {
+		// from default CloseHandler
+		message := websocket.FormatCloseMessage(code, "")
+		err := wsConn.WriteControl(websocket.CloseMessage, message, time.Now().Add(time.Second))
+
+		// our close handling
+		_, _ = wac.Disconnect()
+		wac.handle(&ErrConnectionClosed{Code: code, Text: text})
+		return err
+	})
+
+	wac.ws = &websocketWrapper{
+		conn:  wsConn,
+		close: make(chan struct{}),
 	}
 
+	wac.listener = &listenerWrapper{
+		m: make(map[string]chan string),
+	}
+
+	wac.wg = &sync.WaitGroup{}
+	wac.wg.Add(2)
 	go wac.readPump()
-	go wac.writePump()
-	go wac.keepAlive(20000, 90000)
+	go wac.keepAlive(20000, 60000)
 
-	return wac, nil
+	wac.loggedIn = false
+	return nil
 }
 
-func (wac *Conn) write(data []interface{}) (<-chan string, error) {
-	d, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
+func (wac *Conn) Disconnect() (Session, error) {
+	if !wac.connected {
+		return Session{}, ErrNotConnected
 	}
+	wac.connected = false
+	wac.loggedIn = false
 
-	ts := time.Now().Unix()
-	messageTag := fmt.Sprintf("%d.--%d", ts, wac.msgCount)
-	msg := fmt.Sprintf("%s,%s", messageTag, d)
+	close(wac.ws.close) //signal close
+	wac.wg.Wait()       //wait for close
 
-	ch := make(chan string, 1)
+	err := wac.ws.conn.Close()
+	wac.ws = nil
 
-	wac.listenerMutex.Lock()
-	wac.listener[messageTag] = ch
-	wac.listenerMutex.Unlock()
-
-	wac.writeChan <- wsMsg{websocket.TextMessage, []byte(msg)}
-
-	wac.msgCount++
-	return ch, nil
-}
-
-func (wac *Conn) writeBinary(node binary.Node, metric metric, flag flag, tag string) (<-chan string, error) {
-	if len(tag) < 2 {
-		return nil, fmt.Errorf("no tag specified or to short")
+	if wac.session == nil {
+		return Session{}, err
 	}
-	b, err := binary.Marshal(node)
-	if err != nil {
-		return nil, err
-	}
-
-	cipher, err := cbc.Encrypt(wac.session.EncKey, nil, b)
-	if err != nil {
-		return nil, err
-	}
-
-	h := hmac.New(sha256.New, wac.session.MacKey)
-	h.Write(cipher)
-	hash := h.Sum(nil)
-
-	data := []byte(tag + ",")
-	data = append(data, byte(metric), byte(flag))
-	data = append(data, hash[:32]...)
-	data = append(data, cipher...)
-
-	ch := make(chan string, 1)
-
-	wac.listenerMutex.Lock()
-	wac.listener[tag] = ch
-	wac.listenerMutex.Unlock()
-
-	msg := wsMsg{websocket.BinaryMessage, data}
-	wac.writeChan <- msg
-
-	wac.msgCount++
-	return ch, nil
-}
-
-func (wac *Conn) readPump() {
-	defer wac.wsConn.Close()
-
-	for {
-		msgType, msg, err := wac.wsConn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway) {
-				wac.handle(fmt.Errorf("unexpected websocket close: %v", err))
-			}
-			break
-		}
-
-		data := strings.SplitN(string(msg), ",", 2)
-
-		//Kepp-Alive Timestmap
-		if data[0][0] == '!' {
-			msecs, err := strconv.ParseInt(data[0][1:], 10, 64)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error converting time string to uint: %v\n", err)
-				continue
-			}
-			wac.ServerLastSeen = time.Unix(msecs/1000, (msecs%1000)*int64(time.Millisecond))
-			continue
-		}
-
-		wac.listenerMutex.RLock()
-		listener, hasListener := wac.listener[data[0]]
-		wac.listenerMutex.RUnlock()
-
-		if hasListener && len(data[1]) > 0 {
-			listener <- data[1]
-
-			wac.listenerMutex.Lock()
-			delete(wac.listener, data[0])
-			wac.listenerMutex.Unlock()
-		} else if msgType == 2 && wac.session != nil && wac.session.EncKey != nil {
-			message, err := wac.decryptBinaryMessage([]byte(data[1]))
-			if err != nil {
-				wac.handle(fmt.Errorf("error decoding binary: %v", err))
-				continue
-			}
-
-			wac.dispatch(message)
-		} else {
-			if len(data[1]) > 0 {
-				wac.handle(string(data[1]))
-			}
-		}
-
-	}
-}
-
-func (wac *Conn) writePump() {
-	for msg := range wac.writeChan {
-		if err := wac.wsConn.WriteMessage(msg.messageType, msg.data); err != nil {
-			fmt.Fprintf(os.Stderr, "error writing to socket: %v", err)
-		}
-	}
+	return *wac.session, err
 }
 
 func (wac *Conn) keepAlive(minIntervalMs int, maxIntervalMs int) {
+	defer wac.wg.Done()
+
 	for {
-		wac.writeChan <- wsMsg{
-			messageType: websocket.TextMessage,
-			data:        []byte("?,,"),
+		err := wac.sendKeepAlive()
+		if err != nil {
+			wac.handle(errors.Wrap(err, "keepAlive failed"))
+			//TODO: Consequences?
 		}
 		interval := rand.Intn(maxIntervalMs-minIntervalMs) + minIntervalMs
-		<-time.After(time.Duration(interval) * time.Millisecond)
+		select {
+		case <-time.After(time.Duration(interval) * time.Millisecond):
+		case <-wac.ws.close:
+			return
+		}
 	}
-}
-
-func (wac *Conn) decryptBinaryMessage(msg []byte) (*binary.Node, error) {
-	//message validation
-	h2 := hmac.New(sha256.New, wac.session.MacKey)
-	h2.Write([]byte(msg[32:]))
-	if !hmac.Equal(h2.Sum(nil), msg[:32]) {
-		return nil, fmt.Errorf("message received with invalid hmac")
-	}
-
-	// message decrypt
-	d, err := cbc.Decrypt(wac.session.EncKey, nil, msg[32:])
-	if err != nil {
-		return nil, fmt.Errorf("error decrypting message with AES: %v", err)
-	}
-
-	// message unmarshal
-	message, err := binary.Unmarshal(d)
-	if err != nil {
-		return nil, fmt.Errorf("error decoding binary: %v", err)
-	}
-
-	return message, nil
 }
