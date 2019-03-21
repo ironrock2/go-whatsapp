@@ -120,7 +120,7 @@ github.com/Baozisoftware/qrcode-terminal-go Example login procedure:
 	}
 	fmt.Printf("login successful, session: %v\n", session)
 */
-func (wac *Conn) Login(qrChan chan<- string, message string) (Session, error) {
+func (wac *Conn) Login(qrChan chan<- string) (Session, error) {
 	session := Session{}
 	//Makes sure that only a single Login or Restore can happen at the same time
 	if !atomic.CompareAndSwapUint32(&wac.sessionLock, 0, 1) {
