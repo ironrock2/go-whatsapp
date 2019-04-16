@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"os"
 
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
@@ -151,6 +152,8 @@ func (wac *Conn) connect() (err error) {
 		// our close handling
 		_, _ = wac.Disconnect()
 		wac.handle(&ErrConnectionClosed{Code: code, Text: text})
+
+		os.Exit(3)
 		return err
 	})
 
