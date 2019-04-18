@@ -11,6 +11,7 @@ import (
 	"github.com/pkg/errors"
 	"strconv"
 	"time"
+	"os"
 )
 
 //writeJson enqueues a json message into the writeChan
@@ -98,6 +99,7 @@ func (wac *Conn) write(messageType int, answerMessageTag string, data []byte) (<
 			delete(wac.listener.m, answerMessageTag)
 			wac.listener.Unlock()
 		}
+		os.Exit(3)
 		return nil, errors.Wrap(err, "error writing to websocket")
 	}
 	return ch, nil
